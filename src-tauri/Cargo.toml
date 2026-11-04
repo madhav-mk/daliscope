@@ -1,0 +1,20 @@
+[package]
+name = "daliscope"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DALI commissioning and bus monitor for Lunatone DALI-2 USB interfaces"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+dali-core = { path = "../crates/dali-core" }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+log = "0.4"
+dirs = "5"

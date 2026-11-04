@@ -1,0 +1,5 @@
+# Lunatone DALI USB / DALI-2 USB interfaces (USB vendor 17b5).
+# - give the logged-in user access to the serial port (no dialout group needed)
+# - stop ModemManager from probing the port with AT commands
+SUBSYSTEM=="tty", ATTRS{idVendor}=="17b5", MODE="0660", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="17b5", ENV{ID_MM_DEVICE_IGNORE}="1"

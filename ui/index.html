@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Daliscope</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M4 22h3V10h3v12h1.5V10h3v12h3V10h1.5v12h3V10h1.5v12H28" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/></svg>
+      <span>Daliscope</span>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-view="monitor" role="tab">Bus monitor</button>
+      <button class="tab" data-view="devices" role="tab">Devices</button>
+      <button class="tab" data-view="settings" role="tab">Settings</button>
+    </nav>
+    <div class="spacer"></div>
+    <div id="bus-chip" class="chip muted" title="DALI line state">Bus —</div>
+    <label id="power-wrap" class="switch hidden" title="Integrated 30 mA DALI bus power supply">
+      <input type="checkbox" id="bus-power" />
+      <span class="track"></span>
+      <span class="switch-label">Bus power</span>
+    </label>
+    <button id="conn-pill" class="pill searching" aria-haspopup="dialog">
+      <span class="dot"></span><span id="conn-text">Starting…</span>
+    </button>
+  </header>
+
+  <div id="conn-pop" class="popover hidden" role="dialog" aria-label="Interface details">
+    <div id="conn-pop-body"></div>
+    <div class="pop-actions">
+      <button id="btn-identify-if" class="btn small">Identify interface</button>
+      <button id="btn-reconnect" class="btn small">Reconnect</button>
+      <button id="btn-rescan" class="btn small">Rescan ports</button>
+    </div>
+  </div>
+
+  <main>
+    <!-- ======================= MONITOR ======================= -->
+    <section id="view-monitor" class="view active">
+      <div class="toolbar">
+        <button id="btn-pause" class="btn" title="Pause display (Space)"><span class="ico">❚❚</span><span class="lbl">Pause</span></button>
+        <button id="btn-clear" class="btn" title="Clear (Ctrl/⌘ K)">Clear</button>
+        <button id="btn-mark" class="btn" title="Insert a marker line (M)">Marker</button>
+        <div class="search">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10.5 10.5 14 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          <input id="f-search" type="search" placeholder="Filter: A5, G2, D0, QUERY, 0xFE…  (Ctrl/⌘ F)" spellcheck="false" />
+        </div>
+        <label class="check"><input type="checkbox" id="f-errors" /> Errors only</label>
+        <span id="st-paused" class="badge warn hidden">PAUSED · <span id="st-paused-n">0</span> new</span>
+        <div class="spacer"></div>
+        <button id="btn-export" class="btn" title="Export the rows currently shown">Export…</button>
+      </div>
+
+      <div class="filterbar">
+        <div class="chips" id="filter-chips"></div>
+        <div class="spacer"></div>
+        <div class="stat"><span class="k">Frames/s</span><span class="v" id="st-fps">0</span></div>
+        <div class="stat load"><span class="k">Load</span><div class="bar"><div id="st-load-bar"></div></div><span class="v" id="st-load">0%</span></div>
+        <div class="stat"><span class="k">Errors</span><span class="v" id="st-err">0</span></div>
+        <div class="stat"><span class="k">Events</span><span class="v" id="st-ev">0</span></div>
+        <div class="stat"><span class="k">Rows</span><span class="v" id="st-rows">0</span></div>
+        <label class="check" title="Keep the newest row in view (End)"><input type="checkbox" id="f-follow" checked /> Follow</label>
+      </div>
+
+      <div class="monitor-area">
+        <div class="mon">
+          <div class="mon-head row">
+            <div class="c-seq">#</div><div class="c-time">Time</div><div class="c-dt">Δ ms</div>
+            <div class="c-dir">Dir</div><div class="c-raw">Frame</div><div class="c-tgt">Target</div>
+            <div class="c-cmd">Command</div><div class="c-det">Detail</div>
+          </div>
+          <div id="mon-scroll" class="mon-scroll" tabindex="0">
+            <div id="mon-spacer"><div id="mon-rows"></div></div>
+          </div>
+          <div id="mon-empty" class="empty">
+            <div class="plug">
+              <svg viewBox="0 0 120 60" aria-hidden="true">
+                <rect x="6" y="18" width="40" height="24" rx="5" class="plug-body"/>
+                <rect x="46" y="24" width="18" height="12" rx="2" class="plug-tip"/>
+                <path d="M6 30 H-20" class="plug-cable"/>
+                <rect x="78" y="14" width="36" height="32" rx="6" class="plug-port"/>
+                <rect x="88" y="24" width="16" height="12" rx="2" class="plug-hole"/>
+              </svg>
+            </div>
+            <h2 id="empty-title">Plug in your DALI-2 USB</h2>
+            <p id="empty-sub">It's detected automatically. No drivers or setup needed. Traffic appears here the moment it connects.</p>
+            <div id="empty-ports" class="empty-ports"></div>
+            <button id="btn-use-sim" class="btn ghost">No hardware? Try the simulated interface</button>
+          </div>
+        </div>
+
+        <aside id="inspector" class="inspector hidden">
+          <div class="insp-head">
+            <h3>Frame</h3>
+            <button id="insp-close" class="iconbtn" aria-label="Close">✕</button>
+          </div>
+          <div id="insp-body"></div>
+        </aside>
+      </div>
+
+      <footer class="sendbar">
+        <select id="tx-bits" title="Frame length">
+          <option value="16">16-bit (gear)</option>
+          <option value="24">24-bit (device)</option>
+          <option value="8">8-bit</option>
+          <option value="25">25-bit eDALI</option>
+          <option value="17">17-bit</option>
+        </select>
+        <input id="tx-hex" class="mono" placeholder="FF 00" spellcheck="false" autocomplete="off" />
+        <div id="tx-preview" class="tx-preview mono"></div>
+        <label class="check"><input type="checkbox" id="tx-twice" /> Send twice</label>
+        <label class="check"><input type="checkbox" id="tx-answer" /> Expect answer</label>
+        <select id="tx-template" title="Templates">
+          <option value="">Templates…</option>
+        </select>
+        <button id="btn-send" class="btn primary">Send ⏎</button>
+      </footer>
+    </section>
+
+    <!-- ======================= DEVICES ======================= -->
+    <section id="view-devices" class="view">
+      <div class="dev-layout">
+        <div class="dev-list">
+          <div class="toolbar">
+            <button id="btn-scan" class="btn primary">Scan bus</button>
+            <button id="btn-address" class="btn">Address…</button>
+          </div>
+          <div id="job" class="job hidden">
+            <div class="job-top"><span id="job-text">Working…</span><button id="btn-cancel-job" class="btn small">Cancel</button></div>
+            <div class="bar"><div id="job-bar"></div></div>
+          </div>
+          <div id="dev-tree" class="dev-tree"></div>
+        </div>
+        <div id="dev-detail" class="dev-detail"></div>
+      </div>
+    </section>
+
+    <!-- ======================= SETTINGS ======================= -->
+    <section id="view-settings" class="view">
+      <div class="settings">
+        <section class="card">
+          <h3>Connection</h3>
+          <label class="row-setting">
+            <span><b>Connect automatically</b><small>Watch USB and connect as soon as a DALI-2 USB is plugged in.</small></span>
+            <span class="switch"><input type="checkbox" id="s-auto" /><span class="track"></span></span>
+          </label>
+          <label class="row-setting">
+            <span><b>Probe all USB serial ports</b><small>Also try ports that don't report Lunatone's USB vendor ID (17B5).</small></span>
+            <span class="switch"><input type="checkbox" id="s-probe-all" /><span class="track"></span></span>
+          </label>
+          <label class="row-setting">
+            <span><b>Preferred port</b><small>Optional. Tried first; useful for adapters behind hubs or a simulator pty.</small></span>
+            <span class="inline">
+              <select id="s-port"><option value="">Automatic</option></select>
+              <input id="s-port-manual" class="mono" placeholder="/dev/ttyACM0" spellcheck="false" />
+            </span>
+          </label>
+          <label class="row-setting">
+            <span><b>Simulated interface</b><small>A virtual DALI-2 USB with LED drivers and occupancy sensors, for trying things without hardware.</small></span>
+            <span class="switch"><input type="checkbox" id="s-sim" /><span class="track"></span></span>
+          </label>
+          <div class="pop-actions"><button id="s-rescan" class="btn small">Rescan now</button><button id="s-reconnect" class="btn small">Reconnect</button></div>
+        </section>
+        <section class="card">
+          <h3>Detected serial ports</h3>
+          <table class="ports"><thead><tr><th>Port</th><th>VID:PID</th><th>Product</th><th>Serial</th><th></th></tr></thead><tbody id="s-ports"></tbody></table>
+        </section>
+        <section class="card">
+          <h3>Appearance</h3>
+          <label class="row-setting">
+            <span><b>Theme</b><small>Follow the system, or force light or dark.</small></span>
+            <select id="s-theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select>
+          </label>
+        </section>
+        <section class="card">
+          <h3>Monitor</h3>
+          <label class="row-setting">
+            <span><b>Time column</b><small>Wall-clock time, or time on the interface's bus clock since connecting.</small></span>
+            <select id="s-time"><option value="wall">Wall clock</option><option value="bus">Bus time</option></select>
+          </label>
+          <label class="row-setting">
+            <span><b>Rows kept in view</b><small>Older rows are dropped from the view; export reads the full backend buffer (250k).</small></span>
+            <select id="s-cap"><option>20000</option><option selected>100000</option><option>200000</option></select>
+          </label>
+        </section>
+        <section class="card about">
+          <h3>About</h3>
+          <p>Daliscope <span id="s-version"></span>. Talks to Lunatone DALI-2 USB interfaces using the published LUBA protocol (LUBAP V1.10). Decodes IEC 62386-102/103 with DT6, DT8, 301 and 303 extensions.</p>
+          <p class="muted">Not affiliated with Lunatone. "DALI" and "DALI-2" are trademarks of the DALI Alliance.</p>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <!-- Addressing dialog -->
+  <dialog id="dlg-address" class="dialog">
+    <form method="dialog">
+      <h3>Address devices</h3>
+      <fieldset>
+        <legend>What</legend>
+        <label class="check"><input type="checkbox" id="ad-gear" checked /> Control gear (16-bit, drivers)</label>
+        <label class="check"><input type="checkbox" id="ad-dev" checked /> Control devices (24-bit, sensors &amp; inputs)</label>
+      </fieldset>
+      <fieldset>
+        <legend>Mode</legend>
+        <label class="radio"><input type="radio" name="ad-mode" value="extension" checked /> <span><b>System extension</b><small>Keep existing addresses. Only unaddressed devices get new ones.</small></span></label>
+        <label class="radio"><input type="radio" name="ad-mode" value="new_installation" /> <span><b>New installation</b><small class="warn">Deletes every short address on the bus first, then readdresses everything.</small></span></label>
+      </fieldset>
+      <div class="dlg-actions">
+        <button value="cancel" class="btn">Cancel</button>
+        <button value="ok" id="ad-start" class="btn primary">Start addressing</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="dlg-prompt" class="dialog small">
+    <form method="dialog">
+      <h3 id="pr-title"></h3>
+      <p id="pr-text" class="muted"></p>
+      <input id="pr-input" class="mono" />
+      <div class="dlg-actions">
+        <button value="cancel" class="btn">Cancel</button>
+        <button value="ok" id="pr-ok" class="btn primary">OK</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toasts" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>
