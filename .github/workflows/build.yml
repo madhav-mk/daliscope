@@ -1,0 +1,52 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev
+      - run: cargo test -p dali-core
+
+  bundle:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            args: --target universal-apple-darwin
+          - os: ubuntu-24.04
+            args: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-14' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      - if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libudev-dev patchelf
+      - uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: src-tauri
+          args: ${{ matrix.args }}
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: Daliscope ${{ github.ref_name }}
+          releaseDraft: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daliscope-${{ matrix.os }}
+          path: |
+            target/**/release/bundle/dmg/*.dmg
+            target/**/release/bundle/deb/*.deb
+            target/**/release/bundle/appimage/*.AppImage
