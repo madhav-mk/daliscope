@@ -89,6 +89,7 @@
             <h2 id="empty-title">Plug in your DALI-2 USB</h2>
             <p id="empty-sub">It's detected automatically. No drivers or setup needed. Traffic appears here the moment it connects.</p>
             <div id="empty-ports" class="empty-ports"></div>
+            <div id="empty-diag" class="diag hidden"></div>
             <button id="btn-use-sim" class="btn ghost">No hardware? Try the simulated interface</button>
           </div>
         </div>
@@ -158,6 +159,10 @@
               <select id="s-port"><option value="">Automatic</option></select>
               <input id="s-port-manual" class="mono" placeholder="/dev/ttyACM0" spellcheck="false" />
             </span>
+          </label>
+          <label class="row-setting">
+            <span><b>Log raw interface packets</b><small>Show every LUBA packet exchanged with the interface in the monitor, for troubleshooting.</small></span>
+            <span class="switch"><input type="checkbox" id="s-raw" /><span class="track"></span></span>
           </label>
           <label class="row-setting">
             <span><b>Simulated interface</b><small>A virtual DALI-2 USB with LED drivers and occupancy sensors, for trying things without hardware.</small></span>

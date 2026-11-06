@@ -19,11 +19,13 @@ const prefs = Object.assign(
     time: 'wall',
     theme: 'system',
     cap: 100000,
-    filters: { tx: true, rx: true, gear: true, device: true, event: true, special: true, answer: true, status: true, buffer: false },
+    filters: { tx: true, rx: true, gear: true, device: true, event: true, special: true, answer: true, status: true, buffer: false, luba: true },
     history: [],
   },
   (() => { try { return JSON.parse(localStorage.getItem(PREF_KEY) || '{}'); } catch { return {}; } })()
 );
+// Filters added in later versions default to on for existing users.
+prefs.filters = Object.assign({ luba: true }, prefs.filters);
 const savePrefs = () => { try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch { /* storage unavailable */ } };
 
 const S = {
@@ -45,6 +47,7 @@ const S = {
   busBad: null,
   renderQueued: false,
   dev: { gear: [], devices: [], cache: {}, sel: null, scanned: false },
+  diag: null,
   job: null,
 };
 
@@ -80,7 +83,11 @@ const SCHEMES = ['instance', 'device', 'device/instance', 'device group', 'insta
 const versionText = (v) => (v == null ? '—' : `${v >> 2}.${v & 3}`);
 const shortPort = (p) => String(p || '').replace(/^\/dev\//, '');
 
-function err(e) { return typeof e === 'string' ? e : (e && e.message) || JSON.stringify(e); }
+function err(e) {
+  const m = typeof e === 'string' ? e : (e && e.message) || JSON.stringify(e);
+  if (/bus voltage error/.test(m)) return 'There is no voltage on the DALI line. Check the wiring between the interface and the bus, and that a bus power supply is on.';
+  return m;
+}
 
 async function call(cmd, args, quiet) {
   try { return await invoke(cmd, args); }
@@ -146,7 +153,7 @@ function setConn(s) {
 
   if (s.state === 'connected') {
     S.info = s.info;
-    const hasPower = !!(s.info.descriptor && s.info.descriptor.has_bus_power);
+    const hasPower = !!(s.info.descriptor && s.info.descriptor.has_bus_power) || /DALI-2 USB/i.test(ifaceName(s.info));
     $('#power-wrap').classList.toggle('hidden', !hasPower);
     $('#bus-power').checked = !!(s.info.settings.hardware & 0x80);
     if (!S.wasConnected) {
@@ -167,6 +174,7 @@ function setConn(s) {
       setBusChip();
     }
     S.wasConnected = false;
+    S.diag = null;
     S.info = null;
     $('#power-wrap').classList.add('hidden');
   }
@@ -183,6 +191,9 @@ function ifaceName(i) {
 function setBusChip() {
   const c = $('#bus-chip');
   if (S.conn.state !== 'connected') { c.className = 'chip muted'; c.textContent = 'Bus —'; return; }
+  const line = S.diag && S.diag.line;
+  if (line && line.bus_voltage_error) { c.className = 'chip bad'; c.textContent = 'No bus voltage'; c.title = 'The interface measures no voltage on the DALI line.'; return; }
+  c.title = '';
   if (S.busBad === true) { c.className = 'chip bad'; c.textContent = 'Bus fault'; }
   else if (S.busBad === false) { c.className = 'chip ok'; c.textContent = 'Bus OK'; }
   else { c.className = 'chip muted'; c.textContent = 'Bus idle'; }
@@ -206,7 +217,10 @@ function renderPopover() {
       ['DALI lines', d.lines],
       ['Send buffer', `${d.buffer_size} frames`],
       ['Tick', `${d.tick_us} µs`],
-      ['Bus power', d.has_bus_power ? (i.settings.hardware & 0x80 ? 'integrated, on' : 'integrated, off') : 'external only'],
+      ['Bus power', d.has_bus_power ? (i.settings.hardware & 0x80 ? 'integrated, on' : 'integrated, off') : 'not reported'],
+      ['Bus voltage', S.diag && S.diag.line ? (S.diag.line.bus_voltage_error ? 'NONE' : 'present') : '—'],
+      ['Settings', `mode 0x${hex2(i.settings.mode)} · filter 0x${hex2(i.settings.event_filter)} · hw 0x${hex2(i.settings.hardware)}`],
+      ['Events received', S.diag ? S.diag.events : '—'],
       ['USB', [i.usb_product, i.usb_serial].filter(Boolean).join(' · ') || '—'],
     ];
     b.innerHTML = `<dl>${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl>`;
@@ -236,6 +250,8 @@ $('#bus-power').addEventListener('change', async (e) => {
   try {
     const s = await invoke('set_bus_power', { on });
     e.target.checked = !!(s.hardware & 0x80);
+    if (S.info) S.info.settings = s;
+    if (on && !e.target.checked) { toast('Bus power', 'The interface did not switch its supply on.', 'warn'); return; }
     toast('Bus power ' + (e.target.checked ? 'on' : 'off'), e.target.checked ? 'Integrated 30 mA supply enabled. Keep total supply under 250 mA.' : '');
   } catch (x) {
     e.target.checked = !on;
@@ -257,6 +273,7 @@ const CHIPS = [
   { k: 'answer', label: 'Answers', c: 'var(--green)' },
   { k: 'status', label: 'Status', c: 'var(--amber)' },
   { k: 'buffer', label: 'Buffer', c: 'var(--faint)' },
+  { k: 'luba', label: 'Interface', c: 'var(--faint)' },
 ];
 
 function famKey(r) {
@@ -268,6 +285,7 @@ function famKey(r) {
     case 'backward': return 'answer';
     case 'buffer': return 'buffer';
     case 'note': return 'note';
+    case 'luba': return 'luba';
     default: return 'status';
   }
 }
@@ -307,7 +325,7 @@ function rebuildView() {
 
 function renderChips() {
   const box = $('#filter-chips');
-  box.innerHTML = CHIPS.map((c) => `<button class="fchip ${prefs.filters[c.k] ? 'on' : ''}" data-k="${c.k}" style="--c:${c.c}"><i></i>${esc(c.label)}</button>`).join('');
+  box.innerHTML = CHIPS.filter((c) => c.k !== 'luba' || S.config.raw_log).map((c) => `<button class="fchip ${prefs.filters[c.k] ? 'on' : ''}" data-k="${c.k}" style="--c:${c.c}"><i></i>${esc(c.label)}</button>`).join('');
   $$('.fchip', box).forEach((b) => b.addEventListener('click', () => {
     prefs.filters[b.dataset.k] = !prefs.filters[b.dataset.k];
     savePrefs();
@@ -333,7 +351,7 @@ function ingest(recs) {
     if (r.seq <= S.lastSeq) continue;
     S.lastSeq = r.seq;
     S.recs.push(r);
-    if (r.dir !== 'note') S.frameCount++;
+    if (r.bits) S.frameCount++;
     if (r.error) S.errors++;
     if (r.family === 'event') S.events++;
     if (r.family === 'status') {
@@ -347,7 +365,7 @@ function ingest(recs) {
   const cap = Number(prefs.cap) || 100000;
   if (S.recs.length > cap) {
     S.recs = S.recs.slice(S.recs.length - Math.floor(cap * 0.8));
-    S.frameCount = S.recs.reduce((n, r) => n + (r.dir !== 'note'), 0);
+    S.frameCount = S.recs.reduce((n, r) => n + (r.bits ? 1 : 0), 0);
     rebuildView();
   }
   setBusChip();
@@ -441,10 +459,16 @@ function updateEmpty() {
   if (!show) return;
   $('.plug').classList.toggle('hidden', connected);
   $('#btn-use-sim').classList.toggle('hidden', connected || !!S.config.simulate);
+  $('#empty-diag').classList.toggle('hidden', !connected);
   if (connected) {
-    $('#empty-title').textContent = 'Connected · listening to the bus';
-    $('#empty-sub').textContent = 'No traffic yet. Frames from any master or sensor appear here live. Try Scan bus in Devices, or send a frame below.';
+    const g = S.diag;
+    const noV = g && g.line && g.line.bus_voltage_error;
+    $('#empty-title').textContent = noV ? 'Connected · but the DALI line has no voltage' : 'Connected · listening to the bus';
+    $('#empty-sub').textContent = noV
+      ? 'Nothing can be sent or received until the bus is powered.'
+      : 'A DALI bus stays silent until something transmits. Drivers only speak when asked, so send a test query, scan the bus, or trigger a sensor.';
     $('#empty-ports').innerHTML = '';
+    renderDiag();
   } else {
     $('#empty-title').textContent = S.conn.state === 'disconnected' && S.config.paused ? 'Auto-connect is paused' : 'Plug in your DALI-2 USB';
     $('#empty-sub').textContent = "It's detected automatically. No drivers or setup needed. Traffic appears here the moment it connects.";
@@ -457,6 +481,44 @@ function updateEmpty() {
       (S.lastHint ? `<span class="hint">${esc(S.lastHint)}</span>` : '');
   }
 }
+function renderDiag() {
+  const box = $('#empty-diag');
+  if (box.classList.contains('hidden')) return;
+  const g = S.diag;
+  const i = S.info;
+  const ok = (b, y, n) => `<dd class="${b ? 'good' : 'bad'}">${b ? y : n}</dd>`;
+  if (!g) { box.innerHTML = '<span class="note">Checking the line…</span>'; return; }
+  const line = g.line;
+  const powerCapable = !$('#power-wrap').classList.contains('hidden');
+  box.innerHTML = `
+    <dt>Bus voltage</dt>${line ? ok(!line.bus_voltage_error, 'present', 'none') : '<dd>unknown</dd>'}
+    <dt>Interface bus supply</dt><dd>${g.bus_power ? 'on' : 'off'}</dd>
+    <dt>Event reporting</dt>${ok(!g.events_blocked, 'on', `off (filter 0x${hex2(g.event_filter)})`)}
+    <dt>Events received</dt><dd>${g.events}</dd>
+    ${g.bad_packets ? `<dt>Corrupt packets</dt><dd class="bad">${g.bad_packets}</dd>` : ''}
+    ${line && line.bus_voltage_error ? `<span class="note">${g.bus_power
+      ? "The interface's own supply is on but it still sees no voltage. The interface probably isn't wired to the same DALI pair as the luminaire, or the bus is shorted. Check the DA/DA terminals and the luminaire's DALI connection (on streetlights, often the NEMA/Zhaga socket)."
+      : 'Turn on the interface\'s bus supply, or power the bus from the luminaire (many D4i drivers supply it) or a separate DALI PSU.'}</span>` : ''}
+    <div class="actions">
+      ${line && line.bus_voltage_error && !g.bus_power && powerCapable ? '<button class="btn primary small" id="d-power">Turn on bus power</button>' : ''}
+      <button class="btn small" id="d-test" ${line && line.bus_voltage_error ? 'disabled' : ''}>Send test query</button>
+      <button class="btn small" id="d-raw">${S.config.raw_log ? 'Hide' : 'Show'} interface packets</button>
+    </div>`;
+  const p = $('#d-power');
+  if (p) p.onclick = () => { $('#bus-power').checked = true; $('#bus-power').dispatchEvent(new Event('change')); };
+  $('#d-test').onclick = testQuery;
+  $('#d-raw').onclick = () => saveConfig({ ...S.config, raw_log: !S.config.raw_log });
+  void i;
+}
+
+async function testQuery() {
+  try {
+    const r = await invoke('send_raw', { frame: { bits: 16, value: 0xFF91, send_twice: false, expect_answer: true } });
+    if (r.result === 'answer' || r.result === 'collision') toast('Control gear answered', r.result === 'collision' ? 'Several drivers replied to QUERY CONTROL GEAR PRESENT.' : 'One driver replied to QUERY CONTROL GEAR PRESENT.');
+    else toast('No answer', 'The query went out but no control gear replied.', 'warn');
+  } catch (e) { toast('Test query failed', err(e), 'err'); }
+}
+
 $('#btn-use-sim').addEventListener('click', () => saveConfig({ ...S.config, simulate: true, paused: false }));
 
 /* stats */
@@ -1220,6 +1282,8 @@ async function saveConfig(cfg) {
   S.config = cfg;
   await call('set_config', { config: cfg });
   fillSettings();
+  renderChips();
+  updateEmpty();
 }
 
 function fillSettings() {
@@ -1227,6 +1291,7 @@ function fillSettings() {
   $('#s-auto').checked = !c.paused;
   $('#s-probe-all').checked = !!c.probe_all_usb;
   $('#s-sim').checked = !!c.simulate;
+  $('#s-raw').checked = !!c.raw_log;
   const pinned = c.pinned_port || '';
   const known = S.ports.some((p) => p.path === pinned);
   $('#s-port').innerHTML = `<option value="">Automatic</option>` + S.ports.map((p) => `<option value="${esc(p.path)}" ${p.path === pinned ? 'selected' : ''}>${esc(p.path)}${p.lunatone ? ' · Lunatone' : ''}</option>`).join('');
@@ -1249,6 +1314,7 @@ setInterval(() => { if ($('#view-settings').classList.contains('active')) refres
 $('#s-auto').addEventListener('change', (e) => saveConfig({ ...S.config, paused: !e.target.checked }));
 $('#s-probe-all').addEventListener('change', (e) => saveConfig({ ...S.config, probe_all_usb: e.target.checked }));
 $('#s-sim').addEventListener('change', (e) => saveConfig({ ...S.config, simulate: e.target.checked }));
+$('#s-raw').addEventListener('change', (e) => saveConfig({ ...S.config, raw_log: e.target.checked }));
 $('#s-port').addEventListener('change', (e) => saveConfig({ ...S.config, pinned_port: e.target.value || null }));
 $('#s-port-manual').addEventListener('change', (e) => saveConfig({ ...S.config, pinned_port: e.target.value.trim() || null }));
 $('#s-rescan').addEventListener('click', () => call('rescan'));
@@ -1394,6 +1460,13 @@ function initDropdowns() {
   renderChips();
   listen('monitor://batch', (e) => onBatch(e.payload));
   listen('dongle://state', (e) => setConn(e.payload));
+  listen('dongle://diag', (e) => {
+    const prev = S.diag;
+    S.diag = e.payload;
+    setBusChip();
+    if (!prev || JSON.stringify(prev.line) !== JSON.stringify(S.diag.line) || prev.events !== S.diag.events || prev.bus_power !== S.diag.bus_power) updateEmpty();
+    if (!$('#conn-pop').classList.contains('hidden')) renderPopover();
+  });
   listen('job://progress', (e) => {
     const p = e.payload.progress;
     if (!S.job) return;
@@ -1406,6 +1479,7 @@ function initDropdowns() {
   });
   const snap = await invoke('get_snapshot');
   S.config = snap.config;
+  renderChips();
   S.ports = snap.ports;
   $('#s-version').textContent = 'v' + snap.version;
   fillSettings();

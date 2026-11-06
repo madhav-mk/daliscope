@@ -150,8 +150,13 @@ pub fn parse(data: &[u8], has_tick: bool, has_line: bool) -> Option<RawEvent> {
 
 /// Builds an event payload (used by the simulator and tests).
 pub fn build(tick: u16, line: u8, etype: u8, info: u8, data: &[u8]) -> Vec<u8> {
-    let mut v = tick.to_le_bytes().to_vec();
-    v.push(line);
+    build_opt(Some(tick), Some(line), etype, info, data)
+}
+
+/// Like [`build`], with the optional tick and line fields left out when `None`.
+pub fn build_opt(tick: Option<u16>, line: Option<u8>, etype: u8, info: u8, data: &[u8]) -> Vec<u8> {
+    let mut v = tick.map(|t| t.to_le_bytes().to_vec()).unwrap_or_default();
+    v.extend(line);
     v.push((etype << 6) | (info & 0x3F));
     v.extend_from_slice(data);
     v

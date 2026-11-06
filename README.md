@@ -83,6 +83,17 @@ src-tauri/             desktop shell (Tauri 2)
 ui/                    front end (plain HTML/CSS/JS, no build step)
 ```
 
+## Troubleshooting: connected but no traffic
+
+The Bus monitor shows a line check whenever it's connected but no frames have arrived yet:
+
+- **No bus voltage.** The bus needs a supply: the interface's own (Bus power toggle), the luminaire's (many D4i drivers have one), or a separate DALI PSU. If a supply is on and the interface still sees no voltage, the interface isn't wired to the same DALI pair, or the bus is shorted.
+- **A quiet bus is normal.** Drivers only speak when asked. Use *Send test query* or *Scan bus*.
+- **Event reporting off.** The interface refused to enable events. Replug it.
+- **Settings → Log raw interface packets** shows every LUBA packet, for anything else.
+
+`DALISCOPE_SIM_NO_PSU=1` starts the simulator with an unpowered bus.
+
 ## Notes and limits
 
 - Addressing, scans and parameter access use plain DALI frames, so every

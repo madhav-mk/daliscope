@@ -146,6 +146,17 @@ impl Monitor {
         }
     }
 
+    /// A raw LUBA packet, for the optional interface packet log.
+    pub fn raw(&mut self, outgoing: bool, cmd: u8, data: &[u8]) -> BusRecord {
+        let mut r = self.base(if outgoing { Dir::Tx } else { Dir::Rx }, None);
+        r.family = "luba".into();
+        r.target = if outgoing { "→ iface".into() } else { "← iface".into() };
+        r.raw = format!("{cmd:02X}");
+        r.command = format!("LUBA 0x{cmd:02X} {}{}", crate::luba::cmd_name(cmd), if cmd & 1 == 1 && cmd != 0x31 { " (response)" } else { "" });
+        r.detail = if data.is_empty() { "no data".into() } else { hex(data) };
+        r
+    }
+
     pub fn note(&mut self, text: &str) -> BusRecord {
         let mut r = self.base(Dir::Note, None);
         r.family = "note".into();

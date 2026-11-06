@@ -170,3 +170,100 @@ fn scan_finds_demo_devices() {
     assert_eq!(dv.iter().map(|e| e.address).collect::<Vec<_>>(), vec![0]);
     d.shutdown();
 }
+
+fn wait_connected(d: &Dongle) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !matches!(d.state(), ConnState::Connected { .. }) {
+        assert!(Instant::now() < deadline, "never connected: {:?}", d.state());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn unpowered_bus_reports_voltage_error_until_power_is_on() {
+    let (d, rx) = Dongle::start_with_sim(Sim::demo().without_psu());
+    wait_connected(&d);
+    let e = d.transact(16, 0xFF91, TxMode::query()).unwrap_err();
+    assert!(e.to_string().contains("bus voltage"), "{e}");
+    assert!(d.read_status().unwrap().bus_voltage_error);
+
+    // Diagnostics flag the missing voltage.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut saw = false;
+    while Instant::now() < deadline && !saw {
+        if let Ok(DongleEvent::Diag(g)) = rx.recv_timeout(Duration::from_millis(200)) {
+            saw = g.line.is_some_and(|l| l.bus_voltage_error);
+        }
+    }
+    assert!(saw, "no diag with bus_voltage_error");
+
+    // Integrated supply on -> the bus works.
+    assert!(d.set_bus_power(true).unwrap().bus_power());
+    assert!(!d.read_status().unwrap().bus_voltage_error);
+    assert_eq!(d.transact(16, 0xFF91, TxMode::query()).unwrap(), FrameResult::Collision);
+    d.shutdown();
+}
+
+#[test]
+fn events_without_tick_and_line_still_parse() {
+    // Firmware that refuses to change its filter and omits tick + line.
+    let mut sim = Sim::demo();
+    sim.spontaneous = false;
+    sim.lock_settings = true;
+    sim_set_filter(&mut sim, 0x0C);
+    let (d, rx) = Dongle::start_with_sim(sim);
+    wait_connected(&d);
+    assert_eq!(d.info().unwrap().settings.event_filter, 0x0C);
+    assert_eq!(d.transact(16, 0x0599, TxMode::query()).unwrap(), FrameResult::Answer(0xFF));
+    let recs: Vec<_> = rx.try_iter().filter_map(|e| if let DongleEvent::Record(r) = e { Some(r) } else { None }).collect();
+    assert!(recs.iter().any(|r| r.command == "QUERY DEVICE TYPE" && r.target == "A2"), "{recs:#?}");
+    d.shutdown();
+}
+
+#[test]
+fn blocked_events_are_reported() {
+    let mut sim = Sim::demo();
+    sim.spontaneous = false;
+    sim.lock_settings = true;
+    sim_set_filter(&mut sim, 0x80);
+    let (d, rx) = Dongle::start_with_sim(sim);
+    wait_connected(&d);
+    std::thread::sleep(Duration::from_millis(100));
+    let recs: Vec<_> = rx.try_iter().filter_map(|e| if let DongleEvent::Record(r) = e { Some(r) } else { None }).collect();
+    assert!(recs.iter().any(|r| r.command.contains("event reporting switched off")), "{recs:#?}");
+    d.shutdown();
+}
+
+fn sim_set_filter(sim: &mut Sim, f: u8) {
+    sim.set_event_filter(f);
+}
+
+#[test]
+fn one_byte_add_frame_reply_is_a_frame_id_not_an_error() {
+    // FirstID = 1 must not be mistaken for error 1 ("bus voltage error").
+    let mut sim = Sim::demo();
+    sim.spontaneous = false;
+    sim.short_ack = true;
+    sim.set_next_id(1);
+    let (d, _rx) = Dongle::start_with_sim(sim);
+    wait_connected(&d);
+    for _ in 0..10 {
+        // ids 1..=10 cover every value that overlaps an error code
+        assert_eq!(d.transact(16, 0x0599, TxMode::query()).unwrap(), FrameResult::Answer(0xFF));
+    }
+    let cancel = AtomicBool::new(false);
+    let ctx = Ctx { bus: &d, cancel: &cancel, progress: &|_| {} };
+    assert_eq!(ops::scan(&ctx, Proto::Gear).unwrap().len(), 3);
+    d.shutdown();
+}
+
+#[test]
+fn one_byte_reply_without_power_is_still_an_error() {
+    let mut sim = Sim::demo().without_psu();
+    sim.short_ack = true;
+    let (d, _rx) = Dongle::start_with_sim(sim);
+    wait_connected(&d);
+    let e = d.transact(16, 0xFF91, TxMode::query()).unwrap_err();
+    assert!(e.to_string().contains("bus voltage"), "{e}");
+    d.shutdown();
+}

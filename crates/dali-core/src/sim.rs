@@ -241,6 +241,12 @@ pub struct Sim {
     next_query: Instant,
     last_config: Option<(u8, u32, Instant)>,
     pub spontaneous: bool,
+    /// Another power supply feeds the bus (otherwise only the interface's own can).
+    pub external_psu: bool,
+    /// Ignore SETTINGS writes (models firmware that won't change its filter).
+    pub lock_settings: bool,
+    /// Answer ADD FRAME with FirstID only (NrOfFrames is optional in LUBAP).
+    pub short_ack: bool,
 }
 
 impl Sim {
@@ -263,6 +269,9 @@ impl Sim {
             next_query: now + Duration::from_secs(5),
             last_config: None,
             spontaneous: false,
+            external_psu: true,
+            lock_settings: false,
+            short_ack: false,
         }
     }
 
@@ -341,8 +350,40 @@ impl Sim {
         self.out.insert(pos, (at, bytes));
     }
 
+    /// The bus has voltage when some supply is on.
+    pub fn powered(&self) -> bool {
+        self.external_psu || self.settings.bus_power()
+    }
+
+    pub fn set_next_id(&mut self, id: u8) {
+        self.next_id = id;
+    }
+
+    pub fn set_event_filter(&mut self, f: u8) {
+        self.settings.event_filter = f;
+    }
+
+    /// Builder: a bus with no supply but the interface's own (off by default).
+    pub fn without_psu(mut self) -> Self {
+        self.external_psu = false;
+        self.spontaneous = false;
+        self
+    }
+
     fn push_event(&mut self, at: Instant, etype: u8, info: u8, data: &[u8]) {
-        let d = event::build(self.tick(at), 0, etype, info, data);
+        // Honour the event filter exactly as LUBAP describes it.
+        let f = self.settings.event_filter;
+        let suppressed = f & Settings::F_ALL != 0
+            || (etype == 0 && f & Settings::F_SENT != 0)
+            || (etype == 2 && f & Settings::F_RECEIVED != 0)
+            || (etype == 3 && (info == 3 || info == 4) && f & Settings::F_BUFFER != 0)
+            || (etype == 3 && info >= 60 && f & Settings::F_MACRO != 0);
+        if suppressed {
+            return;
+        }
+        let tick = (f & Settings::F_TICK == 0).then(|| self.tick(at));
+        let line = (f & Settings::F_LINE == 0).then_some(0);
+        let d = event::build_opt(tick, line, etype, info, data);
         self.push(at, cmd::EVENT, d);
     }
 
@@ -396,23 +437,31 @@ impl Sim {
             }
             cmd::SETTINGS => {
                 if let Some(s) = Settings::parse(&p.data) {
-                    self.settings = s;
+                    if !self.lock_settings {
+                        let was = self.powered();
+                        self.settings = s;
+                        if was != self.powered() {
+                            // Bus voltage changes are reported as line events.
+                            self.push_event(at, 3, if self.powered() { 2 } else { 1 }, &[]);
+                        }
+                    }
                 }
                 self.push(at, r, self.settings.bytes().to_vec());
             }
             cmd::READ_STATUS => {
                 let mut d = vec![0];
                 d.extend(self.tick(now).to_le_bytes());
-                d.extend([self.next_id, 0, 0]);
+                d.extend([self.next_id, 0, if self.powered() { 0 } else { 0x80 }]);
                 self.push(at, r, d);
             }
             cmd::IDENTIFY_SELF => self.push(at, r, vec![]),
             cmd::ADD_FRAME | cmd::ADD_FRAME_16 | cmd::ADD_FRAME_24 => {
                 let frames = parse_frames(&p);
                 match frames {
+                    Some(_) if !self.powered() => self.push(at, r, vec![1]),
                     Some(fr) if !fr.is_empty() => {
                         let first = self.next_id;
-                        self.push(at, r, vec![first, fr.len() as u8]);
+                        self.push(at, r, if self.short_ack { vec![first] } else { vec![first, fr.len() as u8] });
                         for (bits, mode, value) in fr {
                             let id = self.next_id;
                             self.next_id = if self.next_id >= 254 { 0 } else { self.next_id + 1 };
@@ -471,7 +520,7 @@ impl Sim {
 
     /// Spontaneous traffic: sensor events and an application controller.
     pub fn pump(&mut self, now: Instant) {
-        if !self.spontaneous {
+        if !self.spontaneous || !self.powered() {
             return;
         }
         if now >= self.next_event {

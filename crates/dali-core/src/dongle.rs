@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -133,7 +133,22 @@ pub enum ConnState {
 pub enum DongleEvent {
     State(ConnState),
     Record(BusRecord),
+    /// Periodic line/interface health, about once a second while connected.
+    Diag(Diag),
     Log { level: String, message: String },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Diag {
+    /// None when the interface didn't answer READ STATUS.
+    pub line: Option<LineStatus>,
+    /// EVENT MESSAGES received since connecting.
+    pub events: u64,
+    /// Bad packets (checksum errors) since connecting.
+    pub bad_packets: u64,
+    pub event_filter: u8,
+    pub events_blocked: bool,
+    pub bus_power: bool,
 }
 
 /// Outcome of a single DALI transmission.
@@ -179,6 +194,8 @@ pub struct ManagerConfig {
     pub simulate: bool,
     /// Pause auto-connect entirely.
     pub paused: bool,
+    /// Show every LUBA packet to/from the interface in the monitor.
+    pub raw_log: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +218,10 @@ pub struct Conn {
     pub port: String,
     enumerated: bool,
     last_rx: Mutex<Instant>,
+    /// Current event filter; decides whether events carry tick and line fields.
+    event_filter: AtomicU8,
+    events_rx: AtomicU64,
+    bad_packets: AtomicU64,
 }
 
 impl Conn {
@@ -216,6 +237,10 @@ impl Conn {
             port,
             enumerated,
             last_rx: Mutex::new(Instant::now()),
+            // Until we know better, assume the documented full format.
+            event_filter: AtomicU8::new(0),
+            events_rx: AtomicU64::new(0),
+            bad_packets: AtomicU64::new(0),
         }
     }
 
@@ -259,7 +284,9 @@ impl Conn {
     fn on_packet(&self, p: Packet) -> Option<RawEvent> {
         *self.last_rx.lock() = Instant::now();
         if p.cmd == cmd::EVENT {
-            let ev = event::parse(&p.data, true, true)?;
+            self.events_rx.fetch_add(1, Ordering::Relaxed);
+            let f = self.event_filter.load(Ordering::Relaxed);
+            let ev = event::parse(&p.data, f & Settings::F_TICK == 0, f & Settings::F_LINE == 0)?;
             if let Some(id) = ev.kind.frame_id() {
                 let mut f = self.frames.lock();
                 let now = Instant::now();
@@ -290,10 +317,20 @@ impl Conn {
     /// Queue one DALI frame and wait until it completes on the bus.
     pub fn transact(&self, line: u8, bits: u8, value: u32, mode: TxMode, timeout: Duration) -> Result<FrameResult> {
         let p = luba::add_frame(line, bits, value, mode);
+        let asked = Instant::now();
         let resp = self.request(p.cmd, p.data, Duration::from_millis(500))?;
         let id = match resp.as_slice() {
             [id, _, ..] => *id,
-            [err] => return Err(DongleError::Rejected(luba::tx_error_text(*err).into())),
+            // NrOfFrames is optional, so a one-byte reply is either FirstID or an
+            // error code (1-7). Frame IDs overlap that range: it's an ID if the
+            // interface goes on to report that frame, and an error if it doesn't.
+            [b] if (1..=7).contains(b) => {
+                if !self.frame_reported(*b, asked, Duration::from_millis(300)) {
+                    return Err(DongleError::Rejected(luba::tx_error_text(*b).into()));
+                }
+                *b
+            }
+            [id] => *id,
             [] => return Err(DongleError::Rejected("empty response".into())),
         };
         let (tx, rx) = unbounded();
@@ -322,7 +359,13 @@ impl Conn {
                         match rx.recv_timeout(left) {
                             Ok(k) => k,
                             Err(_) if sent && !mode.wait_response => return Ok(FrameResult::Sent),
-                            Err(_) => return Err(if self.is_alive() { DongleError::Timeout } else { DongleError::NotConnected }),
+                            Err(_) if !self.is_alive() => return Err(DongleError::NotConnected),
+                            Err(_) if !sent => {
+                                return Err(DongleError::Bus(
+                                    "the interface queued the frame but never reported sending it (no bus power, or bus event reporting is off)".into(),
+                                ))
+                            }
+                            Err(_) => return Err(DongleError::Timeout),
                         }
                     }
                 };
@@ -358,6 +401,20 @@ impl Conn {
         }
     }
 
+    /// Did an event for frame `id` arrive after `since` (waiting up to `wait`)?
+    fn frame_reported(&self, id: u8, since: Instant, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        loop {
+            if self.frames.lock().recent.iter().any(|(rid, _, t)| *rid == id && *t >= since) {
+                return true;
+            }
+            if Instant::now() >= deadline || !self.is_alive() {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(4));
+        }
+    }
+
     pub fn subscribe_macros(&self) -> Receiver<EventKind> {
         let (tx, rx) = unbounded();
         self.macro_subs.lock().push(tx);
@@ -383,6 +440,7 @@ struct Inner {
     monitor: Mutex<Monitor>,
     seq: AtomicU64,
     kick: (Sender<()>, Receiver<()>),
+    sim_override: Mutex<Option<crate::sim::Sim>>,
 }
 
 impl Dongle {
@@ -400,6 +458,7 @@ impl Dongle {
             monitor: Mutex::new(Monitor::new()),
             seq: AtomicU64::new(0),
             kick: bounded(1),
+            sim_override: Mutex::new(None),
         });
         let i2 = inner.clone();
         thread::Builder::new()
@@ -407,6 +466,14 @@ impl Dongle {
             .spawn(move || manager_loop(i2))
             .expect("spawn manager");
         (Self { inner }, rx)
+    }
+
+    /// Start connected to a specific simulated bus (tests, demos).
+    pub fn start_with_sim(sim: crate::sim::Sim) -> (Self, Receiver<DongleEvent>) {
+        let (d, rx) = Self::start(ManagerConfig { paused: true, ..Default::default() });
+        *d.inner.sim_override.lock() = Some(sim);
+        d.set_config(ManagerConfig { simulate: true, ..Default::default() });
+        (d, rx)
     }
 
     pub fn conn(&self) -> Result<Arc<Conn>> {
@@ -464,8 +531,13 @@ impl Dongle {
     }
 
     pub fn write_settings(&self, s: Settings) -> Result<Settings> {
-        let r = self.request(cmd::SETTINGS, s.bytes().to_vec())?;
+        let _ = self.request(cmd::SETTINGS, s.bytes().to_vec())?;
+        // Read back what the interface actually applied rather than trusting the echo.
+        let r = self.request(cmd::SETTINGS, vec![])?;
         let s = Settings::parse(&r).ok_or(DongleError::Other("bad settings response".into()))?;
+        if let Ok(c) = self.conn() {
+            c.event_filter.store(s.event_filter, Ordering::Relaxed);
+        }
         if let Some(i) = self.inner.info.lock().as_mut() {
             i.settings = s;
         }
@@ -549,6 +621,7 @@ fn manager_loop(inner: Arc<Inner>) {
     let mut hb_failures = 0;
     let mut announced_search = false;
     let mut hint: Option<String> = None;
+    let mut last_voltage_error: Option<bool> = None;
     loop {
         if inner.shutdown.load(Ordering::SeqCst) {
             if let Some(c) = inner.conn.lock().take() {
@@ -565,20 +638,46 @@ fn manager_loop(inner: Arc<Inner>) {
                     c.kill("interface unplugged");
                     continue;
                 }
-                if last_heartbeat.elapsed() > Duration::from_secs(2) {
+                if last_heartbeat.elapsed() > Duration::from_millis(1000) {
                     last_heartbeat = Instant::now();
                     let quiet = c.last_rx.lock().elapsed() > Duration::from_millis(1500);
-                    if quiet {
-                        match c.request(cmd::READ_STATUS, vec![0], Duration::from_millis(600)) {
-                            Ok(_) => hb_failures = 0,
-                            Err(_) => {
+                    let line = match c.request(cmd::READ_STATUS, vec![0], Duration::from_millis(600)) {
+                        Ok(d) => {
+                            hb_failures = 0;
+                            LineStatus::parse(&d)
+                        }
+                        Err(_) => {
+                            if quiet {
                                 hb_failures += 1;
                                 if hb_failures >= 3 {
                                     c.kill("interface stopped responding");
                                 }
                             }
+                            None
+                        }
+                    };
+                    if let Some(l) = line {
+                        if last_voltage_error != Some(l.bus_voltage_error) {
+                            if l.bus_voltage_error {
+                                let mut rec = inner.monitor.lock().note("No DALI bus voltage. Turn on Bus power or connect a DALI power supply.");
+                                rec.error = true;
+                                emit_record(&inner, rec);
+                            } else if last_voltage_error.is_some() {
+                                let rec = inner.monitor.lock().note("DALI bus voltage present");
+                                emit_record(&inner, rec);
+                            }
+                            last_voltage_error = Some(l.bus_voltage_error);
                         }
                     }
+                    let settings = inner.info.lock().as_ref().map(|i| i.settings).unwrap_or_default();
+                    let _ = inner.events.send(DongleEvent::Diag(Diag {
+                        line,
+                        events: c.events_rx.load(Ordering::Relaxed),
+                        bad_packets: c.bad_packets.load(Ordering::Relaxed),
+                        event_filter: settings.event_filter,
+                        events_blocked: settings.events_blocked(),
+                        bus_power: settings.bus_power(),
+                    }));
                 }
             }
             Some(c) => {
@@ -591,6 +690,7 @@ fn manager_loop(inner: Arc<Inner>) {
                 set_state(&inner, ConnState::Disconnected { reason });
                 failed.remove(&c.port);
                 announced_search = false;
+                last_voltage_error = None;
                 // Give the OS a moment to settle the device node.
                 thread::sleep(Duration::from_millis(300));
             }
@@ -678,7 +778,12 @@ fn manager_loop(inner: Arc<Inner>) {
 
 fn try_sim(inner: &Arc<Inner>) {
     set_state(inner, ConnState::Probing { port: "simulator".into() });
-    let link = crate::sim::SimLink::new(crate::sim::Sim::demo());
+    let sim = inner.sim_override.lock().take().unwrap_or_else(|| {
+        // DALISCOPE_SIM_NO_PSU=1 simulates a bus with no power supply.
+        let s = crate::sim::Sim::demo();
+        if std::env::var_os("DALISCOPE_SIM_NO_PSU").is_some() { s.without_psu() } else { s }
+    });
+    let link = crate::sim::SimLink::new(sim);
     if !connect(inner, Box::new(link), "simulator".into(), false, None, true) {
         set_state(inner, ConnState::Disconnected { reason: "simulator failed to start".into() });
     }
@@ -703,6 +808,7 @@ fn connect(
         .name(format!("dongle-io {port}"))
         .spawn(move || {
             let mut dec = luba::Decoder::new();
+            let mut tx_dec = luba::Decoder::new();
             let mut buf = [0u8; 512];
             let mut idle_since: Option<Instant> = None;
             while c2.is_alive() {
@@ -710,6 +816,14 @@ fn connect(
                     if let Err(e) = link.write_all(&bytes) {
                         c2.kill(format!("write failed: {e}"));
                         return;
+                    }
+                    if i2.cfg.lock().raw_log {
+                        for p in tx_dec.push(&bytes) {
+                            if p.cmd != cmd::READ_STATUS {
+                                let rec = i2.monitor.lock().raw(true, p.cmd, &p.data);
+                                emit_record(&i2, rec);
+                            }
+                        }
                     }
                 }
                 match link.read(&mut buf) {
@@ -729,6 +843,7 @@ fn connect(
                         for p in dec.push(&buf[..n]) {
                             handle_packet(&i2, &c2, p, &probing);
                         }
+                        c2.bad_packets.store(dec.stats.checksum_errors, Ordering::Relaxed);
                     }
                     Err(e) => {
                         c2.kill(format!("{e}"));
@@ -770,14 +885,24 @@ fn connect(
         .ok()
         .and_then(|d| Settings::parse(&d))
         .unwrap_or_default();
+    conn.event_filter.store(settings.event_filter, Ordering::Relaxed);
     // We need every event, with tick and line, to drive the monitor.
     if settings.event_filter != 0 {
         let mut want = settings;
         want.event_filter = 0;
-        if let Some(s) = conn.request(cmd::SETTINGS, want.bytes().to_vec(), t).ok().and_then(|d| Settings::parse(&d)) {
+        let _ = conn.request(cmd::SETTINGS, want.bytes().to_vec(), t);
+        // Read back rather than trusting the write's echo.
+        if let Some(s) = conn.request(cmd::SETTINGS, vec![], t).ok().and_then(|d| Settings::parse(&d)) {
             settings = s;
         }
+        conn.event_filter.store(settings.event_filter, Ordering::Relaxed);
     }
+    let events_note = settings.events_blocked().then(|| {
+        format!(
+            "The interface kept bus event reporting switched off (event filter 0x{:02X}), so bus traffic can't be shown. Replug it; if this persists, its firmware may need updating.",
+            settings.event_filter
+        )
+    });
     {
         let mut m = inner.monitor.lock();
         m.reset();
@@ -800,6 +925,12 @@ fn connect(
     log(inner, "info", format!("Connected to {} on {port}", display_name(&info)));
     let rec = inner.monitor.lock().note(&format!("Interface connected: {} ({port})", display_name(&info)));
     emit_record(inner, rec);
+    if let Some(n) = events_note {
+        log(inner, "warn", n.clone());
+        let mut rec = inner.monitor.lock().note(&n);
+        rec.error = true;
+        emit_record(inner, rec);
+    }
     set_state(inner, ConnState::Connected { info });
     true
 }
@@ -817,6 +948,10 @@ pub fn display_name(i: &DongleInfo) -> String {
 }
 
 fn handle_packet(inner: &Inner, conn: &Conn, p: Packet, probing_done: &AtomicBool) {
+    if probing_done.load(Ordering::Relaxed) && p.cmd != cmd::response(cmd::READ_STATUS) && inner.cfg.lock().raw_log {
+        let rec = inner.monitor.lock().raw(false, p.cmd, &p.data);
+        emit_record(inner, rec);
+    }
     if let Some(ev) = conn.on_packet(p) {
         // Don't feed the monitor until the connection is fully set up.
         if !probing_done.load(Ordering::Relaxed) {

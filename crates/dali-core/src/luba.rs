@@ -151,6 +151,26 @@ impl Decoder {
     }
 }
 
+pub fn cmd_name(c: u8) -> &'static str {
+    match c & !1 {
+        cmd::QUERY_DEVICE_INFO => "DEVICE INFO",
+        cmd::IDENTIFY_SELF => "IDENTIFY",
+        cmd::DEVICE_NAME => "DEVICE NAME",
+        cmd::QUERY_DEVICE_DESCRIPTOR => "DEVICE DESCRIPTOR",
+        cmd::SETTINGS => "SETTINGS",
+        cmd::READ_STATUS => "READ STATUS",
+        0x30 => "EVENT",
+        cmd::ADD_FRAME => "ADD FRAME",
+        cmd::ADD_FRAME_16 => "ADD 16-BIT FRAME",
+        cmd::ADD_FRAME_24 => "ADD 24-BIT FRAME",
+        cmd::ADD_FRAME_EDALI => "ADD eDALI FRAME",
+        cmd::CONFIG_AUTO_ANSWER => "AUTO ANSWER",
+        cmd::SHORT_BUS => "SHORT BUS",
+        _ if c >= 0x80 => "MACRO",
+        _ => "?",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Request payload builders
 // ---------------------------------------------------------------------------
@@ -336,6 +356,20 @@ impl Settings {
     pub fn bytes(&self) -> [u8; 3] {
         [self.mode, self.event_filter, self.hardware]
     }
+    /// Event filter bits (a set bit suppresses that event / field).
+    pub const F_ALL: u8 = 0x80;
+    pub const F_SENT: u8 = 0x40;
+    pub const F_RECEIVED: u8 = 0x20;
+    pub const F_BUFFER: u8 = 0x10;
+    pub const F_TICK: u8 = 0x08;
+    pub const F_LINE: u8 = 0x04;
+    pub const F_MACRO: u8 = 0x02;
+
+    /// Event types the monitor can't work without are switched off.
+    pub fn events_blocked(&self) -> bool {
+        self.event_filter & (Self::F_ALL | Self::F_SENT | Self::F_RECEIVED) != 0
+    }
+
     pub fn bus_power(&self) -> bool {
         self.hardware & 0x80 != 0
     }

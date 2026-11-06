@@ -15,6 +15,11 @@ fn main() {
         match ev {
             DongleEvent::State(s) => eprintln!("[state] {}", serde_json_lite(&s)),
             DongleEvent::Log { level, message } => eprintln!("[{level}] {message}"),
+            DongleEvent::Diag(g) => {
+                if g.line.is_some_and(|l| l.bus_voltage_error) {
+                    eprintln!("[diag] no DALI bus voltage");
+                }
+            }
             DongleEvent::Record(r) => println!(
                 "{:>10} {:>7} {:<4} {:<9} {:<10} {:<40} {}",
                 r.bus_us.map(|u| format!("{:.1}", u as f64 / 1000.0)).unwrap_or_default(),

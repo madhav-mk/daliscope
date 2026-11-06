@@ -376,6 +376,9 @@ fn pump(handle: AppHandle, rx: crossbeam_channel::Receiver<DongleEvent>) {
                 flush(&handle, &mut batch);
                 let _ = handle.emit("dongle://state", s);
             }
+            Ok(DongleEvent::Diag(g)) => {
+                let _ = handle.emit("dongle://diag", g);
+            }
             Ok(DongleEvent::Log { level, message }) => {
                 let _ = handle.emit("dongle://log", serde_json::json!({ "level": level, "message": message }));
             }
